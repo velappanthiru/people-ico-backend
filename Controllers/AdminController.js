@@ -168,66 +168,66 @@ module.exports = async function (fastify, opts) {
  };
 
  fastify.get('/getActiveSales', async (req, res) => {
- try {
- await updateSaleStatuses(fastify);
+  try {
 
- const activeRows = await fastify.mysql.query(`
- SELECT *,
- CASE
- WHEN NOW() BETWEEN start_at AND end_at THEN 'active'
- WHEN NOW() < start_at THEN 'scheduled'
- ELSE 'ended'
- END AS computed_status
- FROM token_sales
- WHERE status = 'active' OR (NOW() BETWEEN start_at AND end_at)
- ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, start_at DESC
- LIMIT 1
- `);
+    // Always update sale statuses first
+    await updateSaleStatuses(fastify);
 
- let sale = Array.isArray(activeRows) ? (activeRows[0] || null) : (activeRows || null);
+    // Single clean query for ACTIVE or UPCOMING sale
+    const [rows] = await fastify.mysql.query(`
+      SELECT *,
+      CASE
+        WHEN NOW() BETWEEN start_at AND end_at THEN 'active'
+        WHEN NOW() < start_at THEN 'scheduled'
+        ELSE 'completed'
+      END AS computed_status
+      FROM token_sales
+      WHERE NOW() <= end_at   -- Only active or upcoming
+      ORDER BY
+        CASE
+          WHEN NOW() BETWEEN start_at AND end_at THEN 0  -- Active first
+          WHEN NOW() < start_at THEN 1                   -- Upcoming next
+          ELSE 2                                         -- Completed (ignored)
+        END,
+        start_at ASC
+      LIMIT 1;
+    `);
 
- if (!sale) {
- const upcomingRows = await fastify.mysql.query(`
- SELECT *,
- CASE
- WHEN NOW() BETWEEN start_at AND end_at THEN 'active'
- WHEN NOW() < start_at THEN 'scheduled'
- ELSE 'ended'
- END AS computed_status
- FROM token_sales
- WHERE NOW() < start_at
- ORDER BY start_at ASC
- LIMIT 1
- `);
+    const sale = rows?.[0] || null;
 
- sale = Array.isArray(upcomingRows) ? (upcomingRows[0] || null) : (upcomingRows || null);
- }
+    if (!sale) {
+      return res.code(200).send({ status: true, sale: null });
+    }
 
- if (sale) {
- try {
- const soldRows = await fastify.mysql.query(
- `SELECT COALESCE(SUM(CAST(ptc_tokens AS DECIMAL(30,8))), 0) AS total_tokens_sold
- FROM ico_purchases
- WHERE status = 'success' AND created_at BETWEEN ? AND ?`,
- [sale.start_at, sale.end_at]
- );
- const sold = parseFloat(soldRows && soldRows[0] ? soldRows[0].total_tokens_sold : 0) || 0;
- const totalQty = Number(sale.token_quantity || 0);
- sale.total_tokens_sold = sold;
- sale.available_tokens = Math.max(0, totalQty - sold);
- } catch (e) {
- fastify.log && fastify.log.warn && fastify.log.warn('Error calculating sale totals:', e.message || e);
- sale.total_tokens_sold = 0;
- sale.available_tokens = Number(sale.token_quantity || 0);
- }
- }
+    // Fetch sold tokens only within sale window
+    try {
+      const [soldRows] = await fastify.mysql.query(
+        `SELECT COALESCE(SUM(CAST(ptc_tokens AS DECIMAL(30,8))), 0) AS total_tokens_sold
+         FROM ico_purchases
+         WHERE status = 'success' AND created_at BETWEEN ? AND ?`,
+        [sale.start_at, sale.end_at]
+      );
 
- return res.code(200).send({ status: true, sale: sale });
- } catch (err) {
- console.error('Error in /getActiveSales:', err);
- return res.code(500).send({ status: false, msg: 'Internal Server Error' });
- }
- });
+      const sold = parseFloat(soldRows?.total_tokens_sold || 0);
+      const totalQty = Number(sale.token_quantity || 0);
+
+      sale.total_tokens_sold = sold;
+      sale.available_tokens = Math.max(0, totalQty - sold);
+
+    } catch (e) {
+      fastify.log?.warn?.('Error calculating sale totals:', e.message);
+      sale.total_tokens_sold = 0;
+      sale.available_tokens = Number(sale.token_quantity || 0);
+    }
+
+    return res.code(200).send({ status: true, sale });
+
+  } catch (err) {
+    console.error('Error in /getActiveSales:', err);
+    return res.code(500).send({ status: false, msg: 'Internal Server Error' });
+  }
+});
+
 
  fastify.get('/getAllActiveSales', async (req, res) => {
  try {
